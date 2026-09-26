@@ -1,0 +1,15 @@
+Microsoft Entra MFA Readiness Audit
+Copyright (C) 2026 Dan Michel
+
+This is an independent third-party project. It is not affiliated with, endorsed by,
+sponsored by, or distributed by Microsoft.
+
+Microsoft, Microsoft Entra, Windows, and related product names are trademarks of
+the Microsoft group of companies. Their names are used only to identify compatible
+services, products, APIs, and documentation.
+
+This project uses Microsoft Graph APIs but does not include source code from
+Microsoft's Entra SMS/Voice Policy Scanner or other Microsoft repositories.
+
+The project is licensed under GNU General Public License version 3 only
+(GPL-3.0-only). See LICENSE for the governing terms.
