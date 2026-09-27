@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Audits Microsoft Entra MFA readiness for the retirement of Microsoft-provided
     SMS and voice authentication.
@@ -20,12 +20,18 @@
         system/user preferred methods to effective policy scope.
       - Read user sign-in activity to distinguish active, inactive, and accounts
         with no retained successful sign-in timestamp.
+      - Classify users by authentication origin (internal/external) independently
+        from UserType, including Internal Guest, External Guest, Internal Member,
+        and External Member classifications for retirement planning.
       - Read Security Defaults and Conditional Access policies that require MFA or
         an MFA-satisfying authentication strength.
       - Evaluate user/group scope of those Conditional Access policies.
       - Optionally inspect recent sign-in authentication details and actual telephony
         usage, including Graph labels such as "Text message" and
         "Phone call approval (Authentication phone)".
+      - Build migration waves that separate recent telephony users, likely telephony-
+        dependent users, Authenticator-ready users, phishing-resistant users, and
+        unregistered accounts with no retained successful sign-in.
       - Optionally pseudonymize exported identities while retaining cross-file and,
         with a supplied key, cross-run correlation.
 
@@ -69,7 +75,7 @@
     .\Scripts\Get-EntraMfaReadinessAudit.ps1 -Anonymize -AnonymizationKey $key -IncludeRecentUsage
 
 .NOTES
-    Version: 1.3.0
+    Version: 1.5.0
     License: GPL-3.0-only
     Copyright (C) 2026 Dan Michel
 
@@ -77,6 +83,7 @@
       Policy.Read.All
       AuditLog.Read.All
       User.Read.All
+      User.Read
       Group.Read.All
 
     Microsoft Entra directory roles can also affect access to reports and policy data.
@@ -107,7 +114,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.5.0'
 $GraphV1       = 'https://graph.microsoft.com/v1.0'
 $GraphBeta     = 'https://graph.microsoft.com/beta'
 $script:CurrentAuditStage = 'Startup'
@@ -168,6 +175,102 @@ function Get-Prop {
     return $Default
 }
 
+function Get-UserIdentityOriginInfo {
+    param(
+        [Parameter(Mandatory)][object]$User,
+        [string[]]$HostDomains = @()
+    )
+
+    $userType = [string](Get-Prop -Object $User -Name 'userType' -Default '')
+    $upn = [string](Get-Prop -Object $User -Name 'userPrincipalName' -Default '')
+    $externalUserState = [string](Get-Prop -Object $User -Name 'externalUserState' -Default '')
+    $identities = @(Get-Prop -Object $User -Name 'identities' -Default @())
+
+    $normalizedHostDomains = @(
+        $HostDomains |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+            Select-Object -Unique
+    )
+
+    $externalIssuerDetected = $false
+    $hostIssuerDetected = $false
+
+    foreach ($identity in $identities) {
+        $issuer = [string](Get-Prop -Object $identity -Name 'issuer' -Default '')
+        if ([string]::IsNullOrWhiteSpace($issuer)) { continue }
+
+        # Issuer comparison is only authoritative when the tenant's verified
+        # domains were successfully retrieved. If not, fall back to invitation
+        # state and B2B UPN indicators rather than treating every issuer as external.
+        if (@($normalizedHostDomains).Count -gt 0) {
+            $normalizedIssuer = $issuer.Trim().ToLowerInvariant()
+            if ($normalizedIssuer -in $normalizedHostDomains) {
+                $hostIssuerDetected = $true
+            }
+            else {
+                # For workforce tenants, an identity issuer outside the tenant's
+                # verified domains indicates authentication is homed elsewhere.
+                $externalIssuerDetected = $true
+            }
+        }
+    }
+
+    $isExternal = $false
+    $confidence = 'Inferred'
+    $basis = 'No explicit external identity indicator was found.'
+
+    if ($externalUserState -in @('Accepted', 'PendingAcceptance')) {
+        $isExternal = $true
+        $confidence = 'High'
+        $basis = 'B2B invitation state indicates an external identity.'
+    }
+    elseif ($externalIssuerDetected) {
+        $isExternal = $true
+        $confidence = 'High'
+        $basis = 'At least one sign-in identity issuer is outside the tenant verified domains.'
+    }
+    elseif ($upn -match '#EXT#@') {
+        $isExternal = $true
+        $confidence = 'High'
+        $basis = 'B2B-style #EXT# user principal name detected.'
+    }
+    elseif ($hostIssuerDetected) {
+        $isExternal = $false
+        $confidence = 'High'
+        $basis = 'Sign-in identity issuer is a verified domain of this tenant.'
+    }
+    else {
+        $isExternal = $false
+        $confidence = 'Inferred'
+        $basis = 'No external identity indicator was found; treated as internally authenticated.'
+    }
+
+    $origin = if ($isExternal) { 'External' } else { 'Internal' }
+    $relationship = if ($userType -eq 'Guest') { 'Guest' } elseif ($userType -eq 'Member') { 'Member' } else { 'Unknown' }
+    $classification = "$origin $relationship"
+
+    $retirementMilestone = if ($isExternal) {
+        'July 1, 2027 - external user'
+    }
+    elseif ($userType -eq 'Guest') {
+        'February 1, 2027 - internal guest'
+    }
+    else {
+        'February 1, 2027 - internal user (Global Administrators are July 1, 2027)'
+    }
+
+    [PSCustomObject]@{
+        IdentityOrigin              = $origin
+        UserClassification          = $classification
+        IsExternalUser              = $isExternal
+        IdentityOriginConfidence    = $confidence
+        IdentityClassificationBasis = $basis
+        ExternalUserState           = $externalUserState
+        TelephonyRetirementMilestone = $retirementMilestone
+    }
+}
+
 function ConvertTo-UtcText {
     param([AllowNull()][object]$Value)
 
@@ -215,6 +318,7 @@ function Ensure-GraphConnection {
         'Policy.Read.All',
         'AuditLog.Read.All',
         'User.Read.All',
+        'User.Read',
         'Group.Read.All'
     )
 
@@ -629,6 +733,40 @@ function Test-PasskeyOrFido {
     return $false
 }
 
+function Test-AuthenticatorRegistered {
+    param([object[]]$Methods)
+
+    foreach ($method in @($Methods)) {
+        if ([string]$method -in @('microsoftAuthenticatorPush', 'microsoftAuthenticatorPasswordless')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-WindowsHelloForBusinessRegistered {
+    param([object[]]$Methods)
+
+    foreach ($method in @($Methods)) {
+        if ([string]$method -eq 'windowsHelloForBusiness') { return $true }
+    }
+    return $false
+}
+
+function Test-PhishingResistantRegistered {
+    param([object[]]$Methods)
+
+    foreach ($method in @($Methods)) {
+        $value = [string]$method
+        if ($value -match '(?i)^passKey' -or
+            $value -match '(?i)fido' -or
+            $value -eq 'windowsHelloForBusiness') {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-TelephonyPreferred {
     param([string]$Preferred, [object[]]$SystemPreferred)
 
@@ -810,7 +948,10 @@ function Test-UserInCaPolicyUserScope {
         catch { $indeterminate = $true }
     }
 
-    if (@($includeRoles).Count -gt 0) {
+    if (@($includeRoles).Count -gt 0 -and -not $included) {
+        # Role membership is not expanded by this audit. Role targeting is only
+        # unresolved when no direct/all/group/guest include has already established
+        # that this user is in the policy's include scope.
         $indeterminate = $true
         $reasons.Add('Role-targeted include not evaluated')
     }
@@ -832,7 +973,9 @@ function Test-UserInCaPolicyUserScope {
         catch { $indeterminate = $true }
     }
 
-    if (@($excludeRoles).Count -gt 0) {
+    if (@($excludeRoles).Count -gt 0 -and $included -and -not $excluded) {
+        # An unevaluated role exclusion can affect a user who otherwise appears
+        # included, so keep this policy indeterminate until role membership is known.
         $indeterminate = $true
         $reasons.Add('Role-targeted exclusion not evaluated')
     }
@@ -852,6 +995,7 @@ function Get-UserCaMfaCoverage {
     $enabledIds = [System.Collections.Generic.List[string]]::new()
     $reportOnlyNames = [System.Collections.Generic.List[string]]::new()
     $indeterminate = $false
+    $confirmedEnabledCoverage = $false
 
     foreach ($policy in @($MfaPolicies)) {
         $scope = Test-UserInCaPolicyUserScope -User $User -Policy $policy
@@ -866,6 +1010,9 @@ function Get-UserCaMfaCoverage {
         if ($state -eq 'enabled') {
             $enabledNames.Add($exportName)
             $enabledIds.Add($caPolicyId)
+            if (-not $scope.Indeterminate) {
+                $confirmedEnabledCoverage = $true
+            }
         }
         elseif ($state -eq 'enabledForReportingButNotEnforced') {
             $reportOnlyNames.Add($exportName)
@@ -878,7 +1025,11 @@ function Get-UserCaMfaCoverage {
         EnabledPolicyIds        = $enabledIds.ToArray()
         ReportOnlyPolicyCount   = $reportOnlyNames.Count
         ReportOnlyPolicyNames   = ($reportOnlyNames -join '; ')
-        ScopeIndeterminate      = $indeterminate
+        # Do not send every user to enforcement review merely because some
+        # separate MFA policy uses directory-role targeting. If at least one enabled
+        # MFA policy definitively covers the user, unresolved additional policy scope
+        # does not make the user's overall MFA coverage indeterminate.
+        ScopeIndeterminate      = ($indeterminate -and -not $confirmedEnabledCoverage)
         InEnabledMfaPolicyScope = ($enabledNames.Count -gt 0)
     }
 }
@@ -920,8 +1071,16 @@ function Get-TelephonyMethodKind {
     if ([string]::IsNullOrWhiteSpace($AuthenticationMethod)) { return $null }
     $method = $AuthenticationMethod.Trim()
 
-    if ($method -match '^(?i:SMS|Text message)$') { return 'SMS' }
-    if ($method -match '^(?i:Voice|Voice call|Phone call|Phone call approval(?: \(Authentication phone\))?)$') { return 'Voice' }
+    # Graph sign-in authenticationDetails uses human-readable labels that can
+    # differ from registration-report method names. Keep this list deliberately
+    # narrow to avoid classifying unrelated phone-based methods as telephony MFA.
+    if ($method -match '^(?i:SMS|Text message(?: .*)?|SMS one-time passcode)$') {
+        return 'SMS'
+    }
+
+    if ($method -match '^(?i:Voice|Voice call|Phone call(?: approval| verification)?(?: \(.*\))?)$') {
+        return 'Voice'
+    }
 
     return $null
 }
@@ -1106,11 +1265,27 @@ try {
     Set-AuditStage 'Reading Entra users and sign-in activity'
     Write-Section 'Reading Entra users and sign-in activity'
 
-    $users = @(Get-GraphCollection -Uri "$GraphV1/users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,signInActivity&`$top=500")
+    $users = @(Get-GraphCollection -Uri "$GraphV1/users?`$select=id,displayName,userPrincipalName,accountEnabled,userType,externalUserState,identities,signInActivity&`$top=500")
     if (@($users).Count -eq 0) { throw 'Graph returned zero Entra users.' }
     Write-Host ("Users returned: {0:N0}" -f @($users).Count)
 
-    Set-AuditStage 'Expanding effective SMS/Voice policy scope'
+    $hostDomains = @()
+    try {
+        $organizationResponse = Invoke-GraphGet -Uri "$GraphV1/organization?`$select=verifiedDomains"
+        $organization = @(Get-Prop -Object $organizationResponse -Name 'value' -Default @()) | Select-Object -First 1
+        $hostDomains = @(
+            @(Get-Prop -Object $organization -Name 'verifiedDomains' -Default @()) |
+                ForEach-Object { [string](Get-Prop -Object $_ -Name 'name' -Default '') } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        Write-Host ("Tenant verified domains available for identity-origin classification: {0:N0}" -f @($hostDomains).Count)
+    }
+    catch {
+        Write-Warning 'Could not read tenant verified domains. External/internal classification will fall back to invitation state and B2B UPN indicators where possible.'
+        Write-Warning (Get-GraphErrorSummary -ErrorRecord $_)
+    }
+
+    Set-AuditStage 'Expanding effective SMS/Voice policy scope' 
     Write-Section 'Expanding effective SMS/Voice policy scope'
 
     $smsScope = Get-AuthenticationMethodPolicyScope -Method 'SMS' -Configuration $smsPolicy -AllUsers $users
@@ -1290,9 +1465,13 @@ try {
         $phoneRegistered = Test-PhoneRegistered -Methods $methods
         $nonTelephonyMfa = Test-NonTelephonyMfa -Methods $methods
         $passkeyOrFido = Test-PasskeyOrFido -Methods $methods
+        $authenticatorRegistered = Test-AuthenticatorRegistered -Methods $methods
+        $windowsHelloRegistered = Test-WindowsHelloForBusinessRegistered -Methods $methods
+        $phishingResistantRegistered = Test-PhishingResistantRegistered -Methods $methods
         $telephonyPreferred = Test-TelephonyPreferred -Preferred $preferred -SystemPreferred $systemPreferred
         $likelyDependent = $telephonyScope -and $phoneRegistered -and (-not $nonTelephonyMfa)
         $noRegisteredMethods = (@($methods).Count -eq 0)
+        $identityOrigin = Get-UserIdentityOriginInfo -User $user -HostDomains $hostDomains
 
         $signInHistory = Get-SignInHistoryInfo -User $user
         $caCoverage = Get-UserCaMfaCoverage -User $user -MfaPolicies $caMfaPolicies
@@ -1360,6 +1539,55 @@ try {
             $action = 'In SMS/Voice policy scope; no registered phone method was reported.'
         }
 
+        # Migration waves are deliberately mutually exclusive. They are intended
+        # for operational outreach sequencing, not as Microsoft-defined risk tiers.
+        $migrationWaveOrder = 99
+        $migrationWave = 'Not applicable'
+        $migrationWaveReason = 'User is not an enabled account in effective SMS/voice scope.'
+
+        if ((Get-Prop -Object $user -Name 'accountEnabled' -Default $false) -and $telephonyScope) {
+            if ($noRegisteredMethods -and -not $signInHistory.HasSuccessfulSignInRecorded) {
+                $migrationWaveOrder = 90
+                $migrationWave = 'Separate - Unregistered / no successful sign-in recorded'
+                $migrationWaveReason = 'No registered authentication methods and no retained successful sign-in timestamp. Verify account purpose before user outreach.'
+            }
+            elseif ($noRegisteredMethods -and $signInHistory.HasSuccessfulSignInRecorded) {
+                $migrationWaveOrder = 0
+                $migrationWave = 'Review - Unregistered / successful sign-in recorded'
+                $migrationWaveReason = 'Successful sign-in history exists but no registered authentication method is reported. Investigate enforcement before migration outreach.'
+            }
+            elseif ($recentTelephonyUse) {
+                $migrationWaveOrder = 10
+                $migrationWave = 'Tier 1 - Recent SMS/voice use'
+                $migrationWaveReason = 'At least one successful telephony authentication step was observed during the recent sign-in window.'
+            }
+            elseif ($likelyDependent) {
+                $migrationWaveOrder = 20
+                $migrationWave = 'Tier 2 - Telephony dependent / no recent use'
+                $migrationWaveReason = 'Phone authentication is registered and no durable non-telephony MFA alternative was detected, but no recent successful telephony step was observed.'
+            }
+            elseif ($phishingResistantRegistered) {
+                $migrationWaveOrder = 40
+                $migrationWave = 'Tier 4 - Passkey/FIDO2/WHfB ready'
+                $migrationWaveReason = 'A passkey, FIDO-family method, or Windows Hello for Business registration is present.'
+            }
+            elseif ($authenticatorRegistered -and $telephonyPreferred) {
+                $migrationWaveOrder = 30
+                $migrationWave = 'Tier 3A - Authenticator available / telephony preferred'
+                $migrationWaveReason = 'Microsoft Authenticator is registered, but the user/system preference still indicates SMS or voice.'
+            }
+            elseif ($authenticatorRegistered) {
+                $migrationWaveOrder = 31
+                $migrationWave = 'Tier 3B - Authenticator available / telephony not preferred'
+                $migrationWaveReason = 'Microsoft Authenticator is registered and telephony is not currently identified as the preferred method.'
+            }
+            else {
+                $migrationWaveOrder = 50
+                $migrationWave = 'Review - Other in-scope state'
+                $migrationWaveReason = 'The account is in SMS/voice scope but does not match the defined migration-wave patterns.'
+            }
+        }
+
         $enforcementSignals = [System.Collections.Generic.List[string]]::new()
         if ($securityDefaultsEnabled) { $enforcementSignals.Add('Security Defaults enabled') }
         if ($legacyPerUserMfaState -in @('enabled', 'enforced')) { $enforcementSignals.Add("Legacy per-user MFA: $legacyPerUserMfaState") }
@@ -1405,6 +1633,13 @@ try {
             ObjectId                          = $exportObjectId
             AccountEnabled                    = (Get-Prop -Object $user -Name 'accountEnabled' -Default $null)
             UserType                          = [string](Get-Prop -Object $user -Name 'userType' -Default '')
+            IdentityOrigin                    = $identityOrigin.IdentityOrigin
+            UserClassification                = $identityOrigin.UserClassification
+            IsExternalUser                    = $identityOrigin.IsExternalUser
+            IdentityOriginConfidence          = $identityOrigin.IdentityOriginConfidence
+            IdentityClassificationBasis       = $identityOrigin.IdentityClassificationBasis
+            ExternalUserState                 = $identityOrigin.ExternalUserState
+            TelephonyRetirementMilestone      = $identityOrigin.TelephonyRetirementMilestone
             IsAdmin                           = $isAdmin
 
             HasAnySignInActivity              = $signInHistory.HasAnySignInActivity
@@ -1422,7 +1657,10 @@ try {
             MethodsRegistered                 = ($methods -join '; ')
             PhoneRegistered                   = $phoneRegistered
             NonTelephonyMfaRegistered         = $nonTelephonyMfa
+            AuthenticatorRegistered           = $authenticatorRegistered
             PasskeyOrFidoRegistered           = $passkeyOrFido
+            WindowsHelloForBusinessRegistered = $windowsHelloRegistered
+            PhishingResistantRegistered       = $phishingResistantRegistered
             IsMfaRegistered                   = $mfaRegistered
             IsMfaCapable                      = $mfaCapable
             IsPasswordlessCapable             = $passwordless
@@ -1445,6 +1683,7 @@ try {
 
             RecentSmsUseCount                 = $smsCount
             RecentVoiceUseCount               = $voiceCount
+            RecentTelephonyAuthCount           = ($smsCount + $voiceCount)
             RecentSmsOrVoiceUse               = $recentTelephonyUse
             LastSmsOrVoiceUseUtc              = (ConvertTo-UtcText $lastUse)
             LastSmsOrVoiceMethod              = $lastMethod
@@ -1456,6 +1695,9 @@ try {
             RecentCaMfaAppliedSignInCount     = $recentCaMfaAppliedCount
 
             MfaEnforcementAssessment          = $enforcementAssessment
+            MigrationWaveOrder                = $migrationWaveOrder
+            MigrationWave                     = $migrationWave
+            MigrationWaveReason               = $migrationWaveReason
             MigrationPriority                 = $priority
             RecommendedAction                 = $action
         })
@@ -1472,7 +1714,9 @@ try {
 
     $auditPath = Join-Path $OutputDirectory 'MFA-UserAudit.csv'
     $candidatePath = Join-Path $OutputDirectory 'MFA-MigrationCandidates.csv'
+    $migrationWavesPath = Join-Path $OutputDirectory 'MFA-MigrationWaves.csv'
     $enforcementReviewPath = Join-Path $OutputDirectory 'MFA-EnforcementReview.csv'
+    $guestExternalPath = Join-Path $OutputDirectory 'MFA-GuestAndExternalUsers.csv'
     $summaryPath = Join-Path $OutputDirectory 'MFA-Summary.csv'
 
     $audit | Export-Csv $auditPath -NoTypeInformation -Encoding UTF8
@@ -1480,12 +1724,20 @@ try {
     $audit | Where-Object { $_.AccountEnabled -eq $true -and $_.SmsOrVoicePolicyInScope -eq $true } |
         Export-Csv $candidatePath -NoTypeInformation -Encoding UTF8
 
+    $audit | Where-Object { $_.AccountEnabled -eq $true -and $_.SmsOrVoicePolicyInScope -eq $true } |
+        Sort-Object MigrationWaveOrder, DisplayName |
+        Export-Csv $migrationWavesPath -NoTypeInformation -Encoding UTF8
+
     $audit | Where-Object {
         $_.AccountEnabled -eq $true -and $_.SmsOrVoicePolicyInScope -eq $true -and
         ($_.NoRegisteredAuthenticationMethods -eq $true -or
          $_.MfaEnforcementAssessment -like 'Potential enforcement gap*' -or
          $_.CaMfaScopeIndeterminate -eq $true)
     } | Export-Csv $enforcementReviewPath -NoTypeInformation -Encoding UTF8
+
+    $audit | Where-Object { $_.AccountEnabled -eq $true -and ($_.UserType -eq 'Guest' -or $_.IsExternalUser -eq $true) } |
+        Sort-Object UserClassification, DisplayName |
+        Export-Csv $guestExternalPath -NoTypeInformation -Encoding UTF8
 
     $enabled = @($audit | Where-Object AccountEnabled -eq $true)
     $enabledInScope = @($audit | Where-Object { $_.AccountEnabled -eq $true -and $_.SmsOrVoicePolicyInScope -eq $true })
@@ -1498,6 +1750,23 @@ try {
     $caMfaScoped = @($audit | Where-Object { $_.AccountEnabled -eq $true -and $_.CaMfaEnabledPolicyUserScope -eq $true })
     $potentialGaps = @($audit | Where-Object { $_.AccountEnabled -eq $true -and $_.MfaEnforcementAssessment -like 'Potential enforcement gap*' })
     $recentTelephonyUsers = @($audit | Where-Object { $_.AccountEnabled -eq $true -and $_.RecentSmsOrVoiceUse -eq $true })
+    $recentSmsUsers = @($audit | Where-Object { $_.AccountEnabled -eq $true -and $_.RecentSmsUseCount -gt 0 })
+    $recentVoiceUsers = @($audit | Where-Object { $_.AccountEnabled -eq $true -and $_.RecentVoiceUseCount -gt 0 })
+    $waveTier1 = @($audit | Where-Object { $_.MigrationWaveOrder -eq 10 })
+    $waveTier2 = @($audit | Where-Object { $_.MigrationWaveOrder -eq 20 })
+    $waveTier3A = @($audit | Where-Object { $_.MigrationWaveOrder -eq 30 })
+    $waveTier3B = @($audit | Where-Object { $_.MigrationWaveOrder -eq 31 })
+    $waveTier4 = @($audit | Where-Object { $_.MigrationWaveOrder -eq 40 })
+    $waveNeverUsed = @($audit | Where-Object { $_.MigrationWaveOrder -eq 90 })
+    $waveUnregisteredActive = @($audit | Where-Object { $_.MigrationWaveOrder -eq 0 })
+    $waveOtherReview = @($audit | Where-Object { $_.MigrationWaveOrder -eq 50 })
+    $enabledInternalMembers = @($enabled | Where-Object { $_.UserClassification -eq 'Internal Member' })
+    $enabledInternalGuests = @($enabled | Where-Object { $_.UserClassification -eq 'Internal Guest' })
+    $enabledExternalGuests = @($enabled | Where-Object { $_.UserClassification -eq 'External Guest' })
+    $enabledExternalMembers = @($enabled | Where-Object { $_.UserClassification -eq 'External Member' })
+    $enabledExternalUsers = @($enabled | Where-Object { $_.IsExternalUser -eq $true })
+    $enabledInternalGuestsInScope = @($enabledInScope | Where-Object { $_.UserClassification -eq 'Internal Guest' })
+    $enabledExternalUsersInScope = @($enabledInScope | Where-Object { $_.IsExternalUser -eq $true })
 
     $summary = @(
         [PSCustomObject]@{ Metric = 'Script version'; Value = $ScriptVersion }
@@ -1511,6 +1780,13 @@ try {
         [PSCustomObject]@{ Metric = 'Voice policy state'; Value = $voiceScope.State }
         [PSCustomObject]@{ Metric = 'Total Entra users'; Value = @($users).Count }
         [PSCustomObject]@{ Metric = 'Enabled Entra users'; Value = @($enabled).Count }
+        [PSCustomObject]@{ Metric = 'Enabled internal members'; Value = @($enabledInternalMembers).Count }
+        [PSCustomObject]@{ Metric = 'Enabled internal guests'; Value = @($enabledInternalGuests).Count }
+        [PSCustomObject]@{ Metric = 'Enabled external guests'; Value = @($enabledExternalGuests).Count }
+        [PSCustomObject]@{ Metric = 'Enabled external members'; Value = @($enabledExternalMembers).Count }
+        [PSCustomObject]@{ Metric = 'Enabled external users (all UserType values)'; Value = @($enabledExternalUsers).Count }
+        [PSCustomObject]@{ Metric = 'Enabled internal guests in SMS/Voice scope (Feb 1, 2027)'; Value = @($enabledInternalGuestsInScope).Count }
+        [PSCustomObject]@{ Metric = 'Enabled external users in SMS/Voice scope (Jul 1, 2027)'; Value = @($enabledExternalUsersInScope).Count }
         [PSCustomObject]@{ Metric = 'Registration report records'; Value = @($registrations).Count }
         [PSCustomObject]@{ Metric = 'Users matched to registration report'; Value = $registrationMatchCount }
         [PSCustomObject]@{ Metric = 'Effective SMS policy users'; Value = $smsScope.EffectiveUsers.Count }
@@ -1528,6 +1804,16 @@ try {
         [PSCustomObject]@{ Metric = 'Potential MFA enforcement gaps identified'; Value = @($potentialGaps).Count }
         [PSCustomObject]@{ Metric = 'Legacy per-user MFA audit'; Value = $legacyMfaResult.Status }
         [PSCustomObject]@{ Metric = 'Enabled users with recent SMS/Voice use'; Value = @($recentTelephonyUsers).Count }
+        [PSCustomObject]@{ Metric = 'Enabled users with recent SMS use'; Value = @($recentSmsUsers).Count }
+        [PSCustomObject]@{ Metric = 'Enabled users with recent Voice use'; Value = @($recentVoiceUsers).Count }
+        [PSCustomObject]@{ Metric = 'Migration Wave 1 - Recent SMS/Voice use'; Value = @($waveTier1).Count }
+        [PSCustomObject]@{ Metric = 'Migration Wave 2 - Telephony dependent / no recent use'; Value = @($waveTier2).Count }
+        [PSCustomObject]@{ Metric = 'Migration Wave 3A - Authenticator available / telephony preferred'; Value = @($waveTier3A).Count }
+        [PSCustomObject]@{ Metric = 'Migration Wave 3B - Authenticator available / telephony not preferred'; Value = @($waveTier3B).Count }
+        [PSCustomObject]@{ Metric = 'Migration Wave 4 - Passkey/FIDO2/WHfB ready'; Value = @($waveTier4).Count }
+        [PSCustomObject]@{ Metric = 'Migration Separate - Unregistered / no successful sign-in recorded'; Value = @($waveNeverUsed).Count }
+        [PSCustomObject]@{ Metric = 'Migration Review - Unregistered / successful sign-in recorded'; Value = @($waveUnregisteredActive).Count }
+        [PSCustomObject]@{ Metric = 'Migration Review - Other in-scope state'; Value = @($waveOtherReview).Count }
         [PSCustomObject]@{ Metric = 'Recent usage/enforcement audit'; Value = $usageStatus }
     )
 
@@ -1543,7 +1829,9 @@ try {
         $summaryPath,
         $auditPath,
         $candidatePath,
+        $migrationWavesPath,
         $enforcementReviewPath,
+        $guestExternalPath,
         (Join-Path $OutputDirectory 'MFA-PolicyTargets.csv'),
         (Join-Path $OutputDirectory 'MFA-ConditionalAccessMfaPolicies.csv'),
         (Join-Path $OutputDirectory 'MFA-AuthenticationMethodsPolicy.json'),
@@ -1566,8 +1854,10 @@ try {
         }
     }
 
-    Write-Host 'MFA-MigrationCandidates.csv is the working migration list.' -ForegroundColor Cyan
+    Write-Host 'MFA-MigrationWaves.csv is the recommended outreach-sequencing list.' -ForegroundColor Cyan
+    Write-Host 'MFA-MigrationCandidates.csv remains the full enabled in-scope population.' -ForegroundColor Cyan
     Write-Host 'MFA-EnforcementReview.csv isolates unregistered users and other accounts requiring enforcement review.' -ForegroundColor Cyan
+    Write-Host 'MFA-GuestAndExternalUsers.csv separates internal guests from external users for retirement planning.' -ForegroundColor Cyan
 }
 catch {
     Write-AuditFailureContext -ErrorRecord $_
