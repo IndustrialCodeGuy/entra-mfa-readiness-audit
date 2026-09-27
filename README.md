@@ -2,7 +2,7 @@
 
 A read-only PowerShell audit for Microsoft Entra ID environments preparing for the retirement of Microsoft-provided SMS and voice authentication.
 
-The tool expands Authentication Methods policy scope to actual users, correlates MFA registration and passwordless readiness, reviews sign-in activity and MFA enforcement signals, and can optionally inspect recent sign-ins for actual SMS/voice usage.
+The tool expands Authentication Methods policy scope to actual users, correlates MFA registration and passwordless readiness, distinguishes internal versus external identities independently of `UserType`, reviews sign-in activity and MFA enforcement signals, and can optionally inspect recent sign-ins for actual SMS/voice usage.
 
 > **Independent project:** This repository is not affiliated with, endorsed by, sponsored by, or distributed by Microsoft.
 
@@ -19,8 +19,8 @@ No Microsoft source code is included in this project.
 Microsoft's current public-cloud guidance states:
 
 - **September 1, 2026:** passkeys become the default authentication experience for users enabled for SMS or voice, with automatic passkey enablement/registration nudges beginning.
-- **February 1, 2027:** Microsoft-provided SMS and voice delivery is retired for users in scope of the February retirement. Global Administrators and external users follow the later date; internal guest users remain in the February population.
-- **July 1, 2027:** Microsoft-provided SMS and voice delivery is retired for Global Administrators and external users.
+- **February 1, 2027:** Microsoft-provided SMS and voice delivery is retired for standard internal users, including **internal guest users**.
+- **July 1, 2027:** the later retirement applies to **external users** and Global Administrators. `UserType=Guest` alone does not determine which date applies, so this project classifies authentication origin separately.
 
 Always use Microsoft's current documentation as the source of truth:
 
@@ -42,6 +42,7 @@ The script is read-only. It can:
   - System-preferred authentication methods.
   - User-preferred secondary authentication method.
 - Read `signInActivity` to distinguish accounts with successful sign-in history from accounts with no retained successful sign-in timestamp.
+- Classify authentication origin independently of `UserType`, including **Internal Member, Internal Guest, External Guest, and External Member**.
 - Read Security Defaults status.
 - Identify Conditional Access policies requiring MFA or an MFA-satisfying authentication strength.
 - Determine whether a user is in the directly evaluated user/group scope of those policies.
@@ -51,7 +52,7 @@ The script is read-only. It can:
   - MFA-required sign-ins.
   - Enabled MFA Conditional Access policies observed applying to sign-ins.
 - Pseudonymize identifying output while preserving analytical relationships across files.
-- Produce prioritized migration and enforcement-review CSVs.
+- Produce prioritized migration, outreach-wave, and enforcement-review CSVs.
 
 ## What it does **not** claim
 
@@ -78,7 +79,8 @@ The script requests these delegated scopes when it needs to establish a Graph se
 | --- | --- |
 | `Policy.Read.All` | Authentication Methods, Security Defaults, and Conditional Access policy reads |
 | `AuditLog.Read.All` | Authentication Methods registration report, `signInActivity`, and sign-in logs |
-| `User.Read.All` | User inventory |
+| `User.Read.All` | User inventory, sign-in activity, identities, and invitation state |
+| `User.Read` | Tenant verified domains used to distinguish internal and external identity issuers |
 | `Group.Read.All` | Group names and transitive membership expansion |
 
 Microsoft Entra directory roles can also affect access to individual reports and policy resources. `signInActivity` requires Microsoft Entra ID P1 or P2 and `AuditLog.Read.All`.
@@ -101,7 +103,7 @@ The default audit uses Microsoft Graph v1.0 for its core policy, registration, u
     -UsageDays 30
 ```
 
-The recent sign-in authentication-step analysis uses Microsoft Graph beta properties. Failure of that optional section does not invalidate the core audit.
+The recent sign-in authentication-step analysis uses Microsoft Graph beta properties. Failure of that optional section does not invalidate the core audit. Migration Wave 1 depends on this recent-use analysis; without `-IncludeRecentUsage`, recent telephony users cannot be distinguished from users who are merely telephony-dependent.
 
 ### Run against a specific tenant
 
@@ -144,6 +146,10 @@ Microsoft Graph sign-in authentication details can use human-readable labels rat
 - `Voice call`
 - `Phone call`
 - `Phone call approval (Authentication phone)`
+- `Text message verification`
+- `SMS one-time passcode`
+- `Phone call approval`
+- `Phone call verification`
 
 The raw values encountered are also exported to `MFA-RecentAuthMethodSummary.csv`, making unexpected/new Graph labels visible instead of silently discarding them.
 
@@ -156,7 +162,8 @@ A timestamped output directory is created by default.
 | `MFA-Summary.csv` | High-level counts and audit status |
 | `MFA-UserAudit.csv` | Full correlated per-user inventory |
 | `MFA-MigrationCandidates.csv` | Enabled users currently in effective SMS/voice policy scope |
-| `MFA-EnforcementReview.csv` | Unregistered accounts and other enforcement-review candidates |
+| `MFA-MigrationWaves.csv` | Enabled in-scope users assigned to mutually exclusive outreach/migration waves |
+| `MFA-EnforcementReview.csv` | Unregistered accounts, potential enforcement gaps, and users whose MFA Conditional Access coverage remains genuinely unresolved |
 | `MFA-PolicyTargets.csv` | Authentication Methods include/exclude targets and expanded counts |
 | `MFA-ConditionalAccessMfaPolicies.csv` | MFA/authentication-strength CA policies and targeting summary |
 | `MFA-RecentAuthMethodSummary.csv` | Raw recent sign-in authentication methods and step counts; generated with `-IncludeRecentUsage` |
@@ -165,6 +172,24 @@ A timestamped output directory is created by default.
 | `MFA-Voice-Policy.json` | Voice policy snapshot |
 
 See [Docs/output-reference.md](Docs/output-reference.md) for interpretation guidance.
+
+
+## Migration waves
+
+`MFA-MigrationWaves.csv` is the recommended outreach-sequencing file. Each enabled user in effective SMS/voice scope is assigned to one mutually exclusive wave:
+
+| Wave | Meaning | Typical action |
+| --- | --- | --- |
+| `Review - Unregistered / successful sign-in recorded` | Successful sign-in history exists but no registered auth method is reported | Investigate enforcement first |
+| `Tier 1 - Recent SMS/voice use` | A successful telephony authentication step was observed in the requested recent window | First user-contact/remediation wave |
+| `Tier 2 - Telephony dependent / no recent use` | Phone MFA is registered, no durable non-telephony alternative was detected, and no recent successful telephony step was observed | Register replacement method before retirement |
+| `Tier 3A - Authenticator available / telephony preferred` | Microsoft Authenticator is registered, but user/system preference still indicates telephony | Move preference/use toward Authenticator or passkey |
+| `Tier 3B - Authenticator available / telephony not preferred` | Microsoft Authenticator is registered and telephony is not preferred | Lower-priority transition toward phishing-resistant auth |
+| `Tier 4 - Passkey/FIDO2/WHfB ready` | Passkey, FIDO-family method, or Windows Hello for Business is registered | Validate and generally leave out of urgent telephony outreach |
+| `Separate - Unregistered / no successful sign-in recorded` | No methods and no retained successful sign-in timestamp | Verify account purpose/activation separately |
+| `Review - Other in-scope state` | Does not match one of the defined patterns | Manual review |
+
+The wave labels are operational categories defined by this project; they are not Microsoft-defined risk tiers. `MigrationPriority` remains in the per-user exports for backwards compatibility and troubleshooting detail.
 
 ## Migration-priority categories
 
