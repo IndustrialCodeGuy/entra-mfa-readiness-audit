@@ -54,7 +54,10 @@ These represent calculated effective scope after expanding included groups and r
 - `MethodsRegistered`
 - `PhoneRegistered`
 - `NonTelephonyMfaRegistered`
+- `AuthenticatorRegistered`
 - `PasskeyOrFidoRegistered`
+- `WindowsHelloForBusinessRegistered`
+- `PhishingResistantRegistered`
 - `IsMfaRegistered`
 - `IsMfaCapable`
 - `IsPasswordlessCapable`
@@ -74,7 +77,7 @@ These represent calculated effective scope after expanding included groups and r
 - `CaMfaEnabledPolicyCount`
 - `CaMfaEnabledPolicyNames`
 - `CaMfaReportOnlyPolicyCount`
-- `CaMfaScopeIndeterminate`
+- `CaMfaScopeIndeterminate` - true only when unresolved Conditional Access role/other scope could still affect the user's overall MFA coverage; a separate role-targeted policy does not make this true when another enabled MFA policy definitively covers the user
 - `MfaEnforcementAssessment`
 
 Being in a Conditional Access policy's user/group scope does not prove that every sign-in is MFA-enforced; other policy conditions still apply.
@@ -85,6 +88,7 @@ Generated/populated when `-IncludeRecentUsage` is used:
 
 - `RecentSmsUseCount`
 - `RecentVoiceUseCount`
+- `RecentTelephonyAuthCount`
 - `RecentSmsOrVoiceUse`
 - `LastSmsOrVoiceUseUtc`
 - `LastSmsOrVoiceMethod`
@@ -97,9 +101,37 @@ Generated/populated when `-IncludeRecentUsage` is used:
 
 Counts are sign-in/authentication-step observations, not unique people. The summary reports unique users with at least one successful telephony step.
 
+
+### Identity-origin and guest/external fields
+
+- `IdentityOrigin` - `Internal` or `External`; this is independent of `UserType`.
+- `UserClassification` - `Internal Member`, `Internal Guest`, `External Guest`, or `External Member`.
+- `IsExternalUser` - true when authentication is determined to be homed outside the resource tenant.
+- `IdentityOriginConfidence` - `High` when invitation state, identity issuer, or a B2B `#EXT#` UPN provides a direct signal; otherwise `Inferred`.
+- `IdentityClassificationBasis` - non-identifying description of the signal used.
+- `ExternalUserState` - B2B invitation state when Graph reports one.
+- `TelephonyRetirementMilestone` - identity-origin retirement milestone. Internal guests are February 1, 2027; external users are July 1, 2027. Internal-member rows note that Global Administrators have the later July date because this audit does not currently resolve the specific Global Administrator role.
+
+`UserType=Guest` is a relationship/permission label, not an authentication-origin indicator. The audit therefore does not assume every Guest is external.
+
 ## MFA-MigrationCandidates.csv
 
-Subset of enabled users in effective SMS/voice policy scope. Use this as the main working population for migration planning.
+Subset of enabled users in effective SMS/voice policy scope. This remains the complete in-scope working population.
+
+## MFA-MigrationWaves.csv
+
+The same enabled in-scope population, sorted by `MigrationWaveOrder` and `DisplayName`, with mutually exclusive outreach categories.
+
+Important fields:
+
+- `MigrationWaveOrder`
+- `MigrationWave`
+- `MigrationWaveReason`
+- `RecentTelephonyAuthCount`
+- `AuthenticatorRegistered`
+- `PhishingResistantRegistered`
+
+Wave 1 is meaningful only when the audit is run with `-IncludeRecentUsage`; otherwise recent SMS/voice use is not observed and users can fall into later readiness-based waves instead.
 
 ## MFA-EnforcementReview.csv
 
@@ -120,3 +152,7 @@ This file is intentionally useful for detecting future Graph label changes. If M
 - `MFA-Voice-Policy.json`
 
 When `-Anonymize` is enabled, identifying policy/group/user values are pseudonymized or reduced to non-identifying state fields where practical.
+
+## MFA-GuestAndExternalUsers.csv
+
+Contains enabled users where either `UserType=Guest` or `IsExternalUser=True`. It is intended for retirement-date planning and guest/external Conditional Access review. External members are included because the July 1, 2027 retirement follows external authentication origin rather than `UserType`.
